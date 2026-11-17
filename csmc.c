@@ -21,8 +21,7 @@ typedef struct
     size_t  count;
 } Queue;
 
-// One node per student. A student is in at most one priority list at a time,
-// so each student's node is reused for every visit (intrusive link).
+// student struct
 typedef struct PriorityNode
 {
     int studentId;
@@ -30,7 +29,7 @@ typedef struct PriorityNode
     struct PriorityNode *next;
 } PriorityNode;
 
-// One FIFO list per priority level.
+// 1 fifo queue per priority level (H)
 typedef struct
 {
     PriorityNode *head;             // oldest entry; tutors remove from here
@@ -38,17 +37,17 @@ typedef struct
 } PriorityList;
 
 int requiredVisits;
-static Queue waitingRoom;   // FIFO of seated students (IDs), capacity = chairs
-static pthread_mutex_t shopLock;   // protects waitingRoom and the chair check
-static sem_t *studentSem;          // studentSem[id - 1]: tutor -> that student
+static Queue waitingRoom; 
+static pthread_mutex_t shopLock;   // protects chair check
+static sem_t *studentSem;           // tutor -> that student
 static int *assignedTutor;         // assignedTutor[id - 1]: tutor ID, written before the post
 static sem_t arrivals;             // student -> coordinator: one post per seated student
 static PriorityList *priorityLists; // priorityLists[visit - 1]: one list per level (H levels)
 static PriorityNode *priorityNodes; // priorityNodes[id - 1]: the node for each student
-static int *completedVisits;        // completedVisits[id - 1]: finished tutoring sessions
-static long totalVisits;            // num_students * num_help: total arrivals the coordinator serves
-static sem_t work;                  // coordinator -> tutors: one post per queued student, plus one per tutor at shutdown
-static int freeChairs;              // chairs not held by a student; freed by the tutor at selection
+static int *completedVisits;        // finished tutoring sessions
+static long totalVisits;            // num_students x num_help
+static sem_t work;                  // coordinator -> tutor
+static int freeChairs;              // freed by the tutor at selection
 static int numTutors;
 static int numStudents;
 static bool shuttingDown;           // set only when a thread fails to start; every thread checks it and exits
@@ -56,7 +55,7 @@ static bool shuttingDown;           // set only when a thread fails to start; ev
 /////////////////////////////////////////////////////////////////////////////////
 // HELPER FUNCTIONS
 
-// Returns 0 on success, -1 on bad capacity or malloc failure
+// Returns 0 on success, -1 on afil
 int queue_init(Queue *q, size_t capacity) {
     if (capacity == 0) return -1;
     q->data = malloc(capacity * sizeof *q->data);
@@ -81,7 +80,7 @@ int queue_push(Queue *q, int value) {
     return 0;
 }
 
-// Returns 0 on success, -1 if empty. Value goes in *out.
+// Returns 0 on success, -1 if empty
 int queue_pop(Queue *q, int *out) {
     if (q->count == 0) return -1;
     *out = q->data[q->head];
@@ -90,7 +89,7 @@ int queue_pop(Queue *q, int *out) {
     return 0;
 }
 
-// Appends a node to the back of its level (visit - 1). Caller holds shopLock.
+// add customer to back of its queue
 void priority_append(PriorityNode *node)
 {
     PriorityList *level = &priorityLists[node->visit - 1];
@@ -103,8 +102,7 @@ void priority_append(PriorityNode *node)
     }
 }
 
-// Removes the oldest node from the highest-priority non-empty level.
-// Returns NULL if every level is empty. Caller holds shopLock.
+// get next customer
 PriorityNode *priority_take_best(void)
 {
     for (int v = 0; v < requiredVisits; v++) {
@@ -131,8 +129,7 @@ static bool is_shutting_down(void)
     return flag;
 }
 
-// Used only when a thread fails to start. Sets the flag, then posts every semaphore
-// a blocked thread could be waiting on, so each one wakes, sees the flag, and exits.
+// Used only when a thread fails to start. Sets the flag then posts all semaphores to ensure no crash. is his right?
 static void begin_shutdown(void)
 {
     pthread_mutex_lock(&shopLock);
@@ -173,7 +170,7 @@ static int parse_positive_int(const char *text, int *result)
     return 0;
 }
 
-/* Simulates programming: sleeps a random 2-10 ms (thread-safe via rand_r). */
+// Simulates programming sleps a random 2-10 ms
 static void program_delay(unsigned int *seed)
 {
     usleep(2000 + rand_r(seed) % 8001);
@@ -197,7 +194,7 @@ static void *student_thread(void *arg)
 
             pthread_mutex_lock(&shopLock);
 
-            if (shuttingDown) {          // failed startup elsewhere: leave without sitting
+            if (shuttingDown) {          // failed startup
                 pthread_mutex_unlock(&shopLock);
                 return NULL;
             }
@@ -222,18 +219,18 @@ static void *student_thread(void *arg)
         sem_post(&arrivals);
 
         // Wait until a tutor selects this student (the tutor posts this semaphore).
-        // The tutor writes assignedTutor[] before posting, so it is safe to read here.
         sem_wait(&studentSem[id - 1]);
+
+        //  by begin_shutdown()
         if (is_shutting_down()) {
-            return NULL;                 // woken by begin_shutdown(), not by a tutor
+            return NULL;                 
         }
 
-        // Simulated tutoring: 0.2 ms,   independent of the tutor's own sleep.
+        // Simulated tutoring: 0.2 ms   independent of the tutor's own sleep.
         usleep(200);
         log_event(LOG_STUDENT_DONE, id, assignedTutor[id - 1], visit);
 
-        // Count the finished visit. The coordinator reads this under shopLock
-        // after the student re-enters the queue, so the lock orders the access.
+        // Count the finished visit
         completedVisits[id - 1]++;  
     }
     return NULL;
@@ -245,18 +242,20 @@ static void *tutor_thread(void *arg)
 
     for (;;)
     {
-        // Pend until the coordinator has queued a student, or until shutdown.
+        // Pend until the coordinator has queued a student
         sem_wait(&work);
+
+        //  by begin_shutdown()
         if (is_shutting_down()) {
-            break;                       // woken by begin_shutdown()
+            break;                       
         }
 
         pthread_mutex_lock(&shopLock);
 
-        // Select the highest-priority waiting student.
+        // Select the highest priority waiting student.
         PriorityNode *node = priority_take_best();
         if (node == NULL) {
-            // Empty list: this post was a shutdown token, so this tutor is done.
+            // Empty list.
             pthread_mutex_unlock(&shopLock);
             break;
         }
@@ -264,9 +263,9 @@ static void *tutor_thread(void *arg)
         int id = node->studentId;
         int visit = node->visit;
 
-        // The student leaves the waiting area now, so its chair is free immediately.
+        // The student leaves the waiting area now, so it's chair is free immediately.
         freeChairs++;
-        assignedTutor[id - 1] = tutorId;     // written before the post, read by the student
+        assignedTutor[id - 1] = tutorId;    
         log_event(LOG_ASSIGNED, id, tutorId, visit);
 
         pthread_mutex_unlock(&shopLock);
@@ -283,25 +282,23 @@ static void *coordinator_thread(void *arg)
 {
     (void)arg;
 
-    // Each seated student posts `arrivals` once per visit, so the coordinator
-    // gets exactly totalVisits posts. Serving that many arrivals ends the loop.
     for (long served = 0; served < totalVisits; served++)
     {
-        // Pend until a student has been seated and appended to the waiting room.
+        // Pend until a student has been seated and add to the waiting room.
         sem_wait(&arrivals);
+
+        //by begin_shutdown()
         if (is_shutting_down()) {
-            break;                       // woken by begin_shutdown()
+            break;                       
         }
 
         pthread_mutex_lock(&shopLock);
 
         // Pop to the customer that has arrived first in waiting room
-        // (the post guarantees the queue is non-empty, so the return value is not checked)
         int id;
         queue_pop(&waitingRoom, &id);
 
-        // Check the priority level and add to the correct linked list
-        // Visit number = sessions already completed + 1, which is also the priority level.
+        // Check the priority level and add to  correct linked list
         int visit = completedVisits[id - 1] + 1;
         priorityNodes[id - 1].visit = visit;
         priority_append(&priorityNodes[id - 1]);
@@ -313,8 +310,7 @@ static void *coordinator_thread(void *arg)
         // find a way to end the for loop correctly
     }
 
-    // Shutdown: every visit is queued. Post one token per tutor. A tutor that wakes
-    // to an empty priority list takes a token as its signal to exit.
+    // wake up tutor
     for (int t = 0; t < numTutors; t++) {
         sem_post(&work);
     }
@@ -363,6 +359,8 @@ static int run_simulation(int num_students, int num_tutors,
         return -1;
     }
 
+    //dynamic allocs
+
     pthread_t *student_threads = malloc(num_students * sizeof(pthread_t));
     pthread_t *tutor_threads = malloc(num_tutors * sizeof(pthread_t));
     int *student_ids = malloc(num_students * sizeof(int));
@@ -391,7 +389,7 @@ static int run_simulation(int num_students, int num_tutors,
         sems_inited++;
     }
 
-    /* Create threads. IDs start at 1 so they match the log examples. */
+    // Create threads. IDs start at 1 so they match the log examples.
     for (int i = 0; i < num_students; i++) {
         student_ids[i] = i + 1;
         if (pthread_create(&student_threads[i], NULL, student_thread, &student_ids[i]) != 0) {
@@ -418,12 +416,11 @@ static int run_simulation(int num_students, int num_tutors,
     coordinator_started = 1;
 
 join:
-    // Only a creation failure sets result, so the normal path never shuts down early.
+    // worst case scenario
     if (result != 0) {
         begin_shutdown();
     }
-    /* Join only the threads that were actually created. */
-    /* TODO: if a creation failed, signal shutdown before joining blocked threads. */
+    // Join only the threads that were actually created
     for (int i = 0; i < students_started; i++) {
         pthread_join(student_threads[i], NULL);
     }
@@ -435,7 +432,7 @@ join:
     }
 
 cleanup:
-    sem_destroy(&arrivals);   // always initialized by this point
+    sem_destroy(&arrivals);  
     sem_destroy(&work);
     for (int i = 0; i < sems_inited; i++) {
         sem_destroy(&studentSem[i]);
